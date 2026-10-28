@@ -1,0 +1,61 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment Variables
+.env
+.env.local
+.env.*.local
+
+# SQLite Database & Runtime Data
+data/conversations.db*
+data/recordings/*
+!data/recordings/.gitkeep
+!data/.gitkeep
+
+# Model weights & cache (heavy binary files; downloaded at runtime or mounted)
+models/zipformer/*.onnx
+models/zipformer/*.txt
+models/**/.cache/
+!models/zipformer/.gitkeep
+
+# IDEs & Operating Systems
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Logs
+*.log

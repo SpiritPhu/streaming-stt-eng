@@ -1,0 +1,31 @@
+services:
+  streaming-stt:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: streaming-stt-app
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8000}:8000"
+    environment:
+      - PORT=8000
+      - HOST=0.0.0.0
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - NUM_THREADS=${NUM_THREADS:-2}
+      - SAMPLE_RATE=${SAMPLE_RATE:-16000}
+      - SAVE_AUDIO=${SAVE_AUDIO:-true}
+      - MODEL_REPO_ID=${MODEL_REPO_ID:-csukuangfj/sherpa-onnx-streaming-zipformer-en-kroko-2025-08-06}
+      - DATA_DIR=/app/data
+      - MODEL_DIR=/app/models/zipformer
+      - CORS_ORIGINS=${CORS_ORIGINS:-*}
+    volumes:
+      # Persist SQLite database and recorded WAV files
+      - ./data:/app/data
+      # Persist downloaded ONNX models across container recreation
+      - ./models:/app/models
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 45s

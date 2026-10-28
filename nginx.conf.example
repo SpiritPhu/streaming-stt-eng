@@ -1,0 +1,69 @@
+# ==============================================================================
+# Nginx Reverse Proxy Configuration with WebSocket Support for Streaming STT
+# ==============================================================================
+
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+upstream streaming_stt_backend {
+    server 127.0.0.1:8000;
+    keepalive 32;
+}
+
+# Redirect HTTP to HTTPS
+server {
+    listen 80;
+    server_name stt.example.com;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+# HTTPS Server
+server {
+    listen 443 ssl http2;
+    server_name stt.example.com;
+
+    # SSL Certificates (e.g. Let's Encrypt Certbot)
+    ssl_certificate /etc/letsencrypt/live/stt.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/stt.example.com/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+
+    client_max_body_size 50M;
+
+    # WebSocket Endpoint for Real-time Streaming STT
+    location /ws/asr {
+        proxy_pass http://streaming_stt_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Disable buffering to achieve lowest audio streaming latency
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+
+    # REST APIs and Static Web Application
+    location / {
+        proxy_pass http://streaming_stt_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}

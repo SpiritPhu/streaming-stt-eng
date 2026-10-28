@@ -22,6 +22,8 @@ class ConversationStore:
 
     def _init_schema(self) -> None:
         with _LOCK, self._conn:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS conversations (

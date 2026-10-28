@@ -1,0 +1,48 @@
+name: CI & Docker Build Check
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  lint-and-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install flake8
+
+      - name: Python Syntax & Lint Check
+        run: |
+          # Stop build if there are syntax errors or undefined variables
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics --exclude=models,data,.venv
+          # Non-fatal warning check
+          flake8 . --count --exit-zero --max-complexity=12 --max-line-length=120 --statistics --exclude=models,data,.venv
+
+  docker-build-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Verify Docker build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          tags: streaming-stt:ci-test

@@ -13,6 +13,7 @@ import logging
 import os
 import uuid
 import wave
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -20,6 +21,7 @@ from typing import Optional
 import numpy as np
 import sherpa_onnx
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from huggingface_hub import hf_hub_download
@@ -42,8 +44,39 @@ MODEL_DIR = Path(os.environ.get("MODEL_DIR", BASE_DIR / "models" / "zipformer"))
 SAMPLE_RATE = int(os.environ.get("SAMPLE_RATE", "16000"))
 NUM_THREADS = int(os.environ.get("NUM_THREADS", "2"))
 SAVE_AUDIO = os.environ.get("SAVE_AUDIO", "true").lower() in ("1", "true", "yes")
+CORS_ORIGINS = [o.strip() for o in os.environ.get("CORS_ORIGINS", "*").split(",") if o.strip()]
 
-app = FastAPI(title="Streaming Speech-to-Text")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+# Shared recognizer instance; each connection gets its own stream.
+# A lock guards decode calls because the underlying onnxruntime sessions
+# are not guaranteed safe for unsynchronized concurrent decoding.
+_recognizer: sherpa_onnx.OnlineRecognizer | None = None
+_decode_lock = asyncio.Lock()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Initializing speech recognizer on startup...")
+    try:
+        get_recognizer()
+        logger.info("Speech recognizer model loaded successfully.")
+    except Exception:
+        logger.exception("Failed to load speech recognizer model on startup")
+    yield
+    logger.info("Shutting down Streaming STT server...")
+
+
+app = FastAPI(title="Streaming Speech-to-Text", version="1.0.0", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS if CORS_ORIGINS != ["*"] else ["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 store = ConversationStore(DATA_DIR / "conversations.db")
@@ -52,11 +85,7 @@ store = ConversationStore(DATA_DIR / "conversations.db")
 class RenameRequest(BaseModel):
     title: str
 
-# Shared recognizer instance; each connection gets its own stream.
-# A lock guards decode calls because the underlying onnxruntime sessions
-# are not guaranteed safe for unsynchronized concurrent decoding.
-_recognizer: sherpa_onnx.OnlineRecognizer | None = None
-_decode_lock = asyncio.Lock()
+
 
 
 def _download_model() -> dict[str, str]:
@@ -90,11 +119,6 @@ def get_recognizer() -> sherpa_onnx.OnlineRecognizer:
     return _recognizer
 
 
-@app.on_event("startup")
-def _warm_up() -> None:
-    get_recognizer()
-
-
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(str(STATIC_DIR / "index.html"))
@@ -102,7 +126,13 @@ def index() -> FileResponse:
 
 @app.get("/healthz")
 def healthz() -> dict:
-    return {"status": "ok", "model_loaded": _recognizer is not None}
+    return {
+        "status": "ok",
+        "model_loaded": _recognizer is not None,
+        "model_repo": MODEL_REPO_ID,
+        "sample_rate": SAMPLE_RATE,
+        "save_audio": SAVE_AUDIO,
+    }
 
 
 @app.get("/api/conversations")
@@ -213,3 +243,12 @@ async def websocket_asr(websocket: WebSocket) -> None:
         await asyncio.to_thread(
             store.finalize_conversation, conversation_id, str(audio_path) if audio_path else None
         )
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    host = os.environ.get("HOST", "0.0.0.0")
+    port = int(os.environ.get("PORT", "8000"))
+    uvicorn.run("app:app", host=host, port=port, reload=False)
+

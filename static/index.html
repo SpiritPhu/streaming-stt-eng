@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Streaming Speech-to-Text</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 860px; margin: 40px auto; padding: 0 16px; }
+  h1 { font-size: 1.4rem; }
+  #status { font-weight: 600; margin-bottom: 12px; }
+  #status.connected { color: #1a7f37; }
+  #status.disconnected { color: #b42318; }
+  #transcript { border: 1px solid #ccc; border-radius: 8px; padding: 16px; min-height: 160px; white-space: pre-wrap; background: #fafafa; }
+  #partial { color: #777; font-style: italic; }
+  button { padding: 10px 18px; font-size: 1rem; margin-right: 8px; cursor: pointer; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .tabs { margin: 16px 0; border-bottom: 1px solid #ddd; }
+  .tab-btn { background: none; border: none; border-bottom: 2px solid transparent; padding: 8px 4px; margin-right: 24px; font-size: 1rem; }
+  .tab-btn.active { border-bottom-color: #1a7f37; font-weight: 600; }
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
+
+  .history-controls { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+  .history-controls input { padding: 8px 10px; font-size: 0.95rem; border: 1px solid #ccc; border-radius: 6px; }
+  #historyList { list-style: none; padding: 0; margin: 0; border: 1px solid #ddd; border-radius: 8px; max-height: 260px; overflow-y: auto; }
+  #historyList li { padding: 10px 12px; border-bottom: 1px solid #eee; cursor: pointer; }
+  #historyList li:last-child { border-bottom: none; }
+  #historyList li:hover { background: #f3f3f3; }
+  #historyList li.active { background: #e7f5ea; }
+  .conv-meta { color: #777; font-size: 0.85rem; }
+
+  #conversationDetail { border: 1px solid #ccc; border-radius: 8px; padding: 16px; margin-top: 12px; background: #fafafa; }
+  #conversationDetail textarea { width: 100%; min-height: 160px; font-family: inherit; }
+  .detail-actions { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; }
+</style>
+</head>
+<body>
+  <h1>Realtime Speech-to-Text</h1>
+
+  <div class="tabs">
+    <button class="tab-btn active" data-tab="live">Live</button>
+    <button class="tab-btn" data-tab="history">Lịch sử</button>
+  </div>
+
+  <div id="live" class="tab-panel active">
+    <div id="status" class="disconnected">Disconnected</div>
+    <button id="startBtn">Start</button>
+    <button id="stopBtn" disabled>Stop</button>
+    <button id="clearBtn">Clear</button>
+    <div id="transcript"></div>
+    <p id="partial"></p>
+  </div>
+
+  <div id="history" class="tab-panel">
+    <div class="history-controls">
+      <input type="date" id="dateFilter" />
+      <input type="search" id="searchFilter" placeholder="Tìm trong nội dung..." />
+      <button id="refreshHistoryBtn">Làm mới</button>
+      <button id="clearFilterBtn">Xóa bộ lọc</button>
+    </div>
+    <ul id="historyList"></ul>
+    <div id="conversationDetail" style="display: none;">
+      <input id="titleInput" type="text" placeholder="Tiêu đề cuộc hội thoại" style="width: 100%; padding: 8px; margin-bottom: 8px;" />
+      <textarea id="detailTranscript" readonly></textarea>
+      <audio id="detailAudio" controls style="width: 100%; margin-top: 8px; display: none;"></audio>
+      <div class="detail-actions">
+        <button id="saveTitleBtn">Lưu tiêu đề</button>
+        <button id="exportBtn">Tải transcript (.txt)</button>
+        <button id="deleteConvBtn">Xóa</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
