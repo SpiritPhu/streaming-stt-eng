@@ -13,7 +13,6 @@ import logging
 import os
 import uuid
 import wave
-from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -21,7 +20,6 @@ from typing import Optional
 import numpy as np
 import sherpa_onnx
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from huggingface_hub import hf_hub_download
@@ -42,41 +40,17 @@ MODEL_REPO_ID = os.environ.get(
 )
 MODEL_DIR = Path(os.environ.get("MODEL_DIR", BASE_DIR / "models" / "zipformer"))
 SAMPLE_RATE = int(os.environ.get("SAMPLE_RATE", "16000"))
-NUM_THREADS = int(os.environ.get("NUM_THREADS", "2"))
+# Default threads to the available CPU cores (capped) so a single stream
+# decodes well below real time on a CPU-only host.
+NUM_THREADS = int(os.environ.get("NUM_THREADS", str(min(4, os.cpu_count() or 2))))
+PROVIDER = os.environ.get("PROVIDER", "cpu")
+ENCODER_FILE = os.environ.get("ENCODER_FILE", "encoder.onnx")
+DECODER_FILE = os.environ.get("DECODER_FILE", "decoder.onnx")
+JOINER_FILE = os.environ.get("JOINER_FILE", "joiner.onnx")
+TOKENS_FILE = os.environ.get("TOKENS_FILE", "tokens.txt")
 SAVE_AUDIO = os.environ.get("SAVE_AUDIO", "true").lower() in ("1", "true", "yes")
-CORS_ORIGINS = [o.strip() for o in os.environ.get("CORS_ORIGINS", "*").split(",") if o.strip()]
 
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
-MODEL_DIR.mkdir(parents=True, exist_ok=True)
-
-# Shared recognizer instance; each connection gets its own stream.
-# A lock guards decode calls because the underlying onnxruntime sessions
-# are not guaranteed safe for unsynchronized concurrent decoding.
-_recognizer: sherpa_onnx.OnlineRecognizer | None = None
-_decode_lock = asyncio.Lock()
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("Initializing speech recognizer on startup...")
-    try:
-        get_recognizer()
-        logger.info("Speech recognizer model loaded successfully.")
-    except Exception:
-        logger.exception("Failed to load speech recognizer model on startup")
-    yield
-    logger.info("Shutting down Streaming STT server...")
-
-
-app = FastAPI(title="Streaming Speech-to-Text", version="1.0.0", lifespan=lifespan)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=CORS_ORIGINS if CORS_ORIGINS != ["*"] else ["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="Streaming Speech-to-Text")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 store = ConversationStore(DATA_DIR / "conversations.db")
@@ -86,13 +60,23 @@ class RenameRequest(BaseModel):
     title: str
 
 
+# Shared recognizer instance; each connection gets its own stream.
+# ONNX Runtime sessions are safe for concurrent Run() calls and each stream
+# holds its own decoding state, so decoding can run from worker threads
+# (one decoder task per connection) without a global lock.
+_recognizer: sherpa_onnx.OnlineRecognizer | None = None
 
 
 def _download_model() -> dict[str, str]:
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     files = {}
-    for name in ("encoder.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"):
-        files[name] = hf_hub_download(
+    for key, name in (
+        ("encoder", ENCODER_FILE),
+        ("decoder", DECODER_FILE),
+        ("joiner", JOINER_FILE),
+        ("tokens", TOKENS_FILE),
+    ):
+        files[key] = hf_hub_download(
             repo_id=MODEL_REPO_ID, filename=name, local_dir=str(MODEL_DIR)
         )
     return files
@@ -104,19 +88,24 @@ def get_recognizer() -> sherpa_onnx.OnlineRecognizer:
         logger.info("Loading model %s into %s", MODEL_REPO_ID, MODEL_DIR)
         files = _download_model()
         _recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
-            tokens=files["tokens.txt"],
-            encoder=files["encoder.onnx"],
-            decoder=files["decoder.onnx"],
-            joiner=files["joiner.onnx"],
+            tokens=files["tokens"],
+            encoder=files["encoder"],
+            decoder=files["decoder"],
+            joiner=files["joiner"],
             num_threads=NUM_THREADS,
             sample_rate=SAMPLE_RATE,
             feature_dim=80,
             decoding_method="greedy_search",
             enable_endpoint_detection=True,
-            provider="cpu",
+            provider=PROVIDER,
         )
         logger.info("Recognizer ready")
     return _recognizer
+
+
+@app.on_event("startup")
+def _warm_up() -> None:
+    get_recognizer()
 
 
 @app.get("/")
@@ -126,13 +115,7 @@ def index() -> FileResponse:
 
 @app.get("/healthz")
 def healthz() -> dict:
-    return {
-        "status": "ok",
-        "model_loaded": _recognizer is not None,
-        "model_repo": MODEL_REPO_ID,
-        "sample_rate": SAMPLE_RATE,
-        "save_audio": SAVE_AUDIO,
-    }
+    return {"status": "ok", "model_loaded": _recognizer is not None}
 
 
 @app.get("/api/conversations")
@@ -194,7 +177,6 @@ async def websocket_asr(websocket: WebSocket) -> None:
     conversation_id = await asyncio.to_thread(store.create_conversation, session_id)
     logger.info("Client connected: %s (conversation #%s)", websocket.client, conversation_id)
 
-    seq = 0
     wav_writer: wave.Wave_write | None = None
     audio_path: Path | None = None
     if SAVE_AUDIO:
@@ -206,37 +188,56 @@ async def websocket_asr(websocket: WebSocket) -> None:
         wav_writer.setsampwidth(2)
         wav_writer.setframerate(SAMPLE_RATE)
 
-    try:
+    # Bounded queue decouples socket reads from CPU decoding and applies
+    # backpressure instead of growing memory without limit.
+    audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=128)
+
+    def process_chunk(pcm: bytes) -> tuple[str, bool]:
+        """Ingest + decode one chunk in a worker thread (keeps the loop free)."""
+        if wav_writer is not None:
+            wav_writer.writeframes(pcm)
+        samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+        stream.accept_waveform(SAMPLE_RATE, samples)
+        while recognizer.is_ready(stream):
+            recognizer.decode_stream(stream)
+        text = recognizer.get_result(stream).strip()
+        is_endpoint = recognizer.is_endpoint(stream)
+        if is_endpoint:
+            recognizer.reset(stream)
+        return text, is_endpoint
+
+    async def receiver() -> None:
+        try:
+            while True:
+                message = await websocket.receive_bytes()
+                await audio_queue.put(message)
+        except WebSocketDisconnect:
+            logger.info("Client disconnected: %s", websocket.client)
+        finally:
+            await audio_queue.put(None)
+
+    async def decoder() -> None:
+        seq = 0
         while True:
-            message = await websocket.receive_bytes()
-            if wav_writer is not None:
-                wav_writer.writeframes(message)
-
-            # Frontend sends little-endian 16-bit PCM mono at SAMPLE_RATE.
-            samples = np.frombuffer(message, dtype=np.int16).astype(np.float32) / 32768.0
-
-            async with _decode_lock:
-                stream.accept_waveform(SAMPLE_RATE, samples)
-                while recognizer.is_ready(stream):
-                    recognizer.decode_stream(stream)
-
-                text = recognizer.get_result(stream).strip()
-                is_endpoint = recognizer.is_endpoint(stream)
-                if is_endpoint:
-                    recognizer.reset(stream)
-
+            message = await audio_queue.get()
+            if message is None:
+                break
+            text, is_endpoint = await asyncio.to_thread(process_chunk, message)
             if is_endpoint and text:
                 seq += 1
                 await asyncio.to_thread(store.add_segment, conversation_id, seq, text)
-
             await websocket.send_json(
                 {"text": text, "is_final": is_endpoint, "conversation_id": conversation_id}
             )
-    except WebSocketDisconnect:
-        logger.info("Client disconnected: %s", websocket.client)
+
+    try:
+        await asyncio.gather(receiver(), decoder())
     except Exception:
         logger.exception("Error while processing audio stream")
-        await websocket.close(code=1011)
+        try:
+            await websocket.close(code=1011)
+        except RuntimeError:
+            pass
     finally:
         if wav_writer is not None:
             wav_writer.close()
@@ -251,4 +252,3 @@ if __name__ == "__main__":
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "8000"))
     uvicorn.run("app:app", host=host, port=port, reload=False)
-

@@ -1,4 +1,7 @@
 const TARGET_SAMPLE_RATE = 16000;
+// Batch mic audio into ~120 ms blocks before sending to drastically cut
+// per-message overhead (hundreds of tiny WS frames/sec -> ~8/sec).
+const CHUNK_MS = 120;
 
 const statusEl = document.getElementById("status");
 const transcriptEl = document.getElementById("transcript");
@@ -12,6 +15,9 @@ let mediaStream = null;
 let sourceNode = null;
 let workletNode = null;
 let socket = null;
+let captureChunks = [];
+let capturedLength = 0;
+let nativeChunkSize = 0;
 
 function setStatus(text, connected) {
   statusEl.textContent = text;
@@ -76,18 +82,41 @@ async function start() {
   sourceNode = audioContext.createMediaStreamSource(mediaStream);
   workletNode = new AudioWorkletNode(audioContext, "pcm-capture-processor");
 
+  captureChunks = [];
+  capturedLength = 0;
+  nativeChunkSize = Math.round((audioContext.sampleRate * CHUNK_MS) / 1000);
+
   workletNode.port.onmessage = (event) => {
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
-    const resampled = downsampleTo16k(event.data, audioContext.sampleRate);
-    socket.send(floatTo16BitPCM(resampled));
+    captureChunks.push(event.data);
+    capturedLength += event.data.length;
+    if (capturedLength < nativeChunkSize) return;
+    flushCaptureBuffer();
   };
 
   sourceNode.connect(workletNode);
   stopBtn.disabled = false;
 }
 
+// Merge buffered native-rate samples, resample to 16 kHz and send one frame.
+function flushCaptureBuffer() {
+  if (capturedLength === 0 || !socket || socket.readyState !== WebSocket.OPEN) return;
+  const merged = new Float32Array(capturedLength);
+  let offset = 0;
+  for (const chunk of captureChunks) {
+    merged.set(chunk, offset);
+    offset += chunk.length;
+  }
+  captureChunks = [];
+  capturedLength = 0;
+  const resampled = downsampleTo16k(merged, audioContext.sampleRate);
+  socket.send(floatTo16BitPCM(resampled));
+}
+
 function stop() {
   stopBtn.disabled = true;
+
+  flushCaptureBuffer();
 
   if (workletNode) {
     workletNode.disconnect();
